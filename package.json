@@ -1,11 +1,8 @@
-"scripts": {
-    "start": "node server.js"
-}
 {
-  "name": "backend",
+  "name": "timetable-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Smart Timetable Scheduler Backend",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
