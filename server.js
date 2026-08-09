@@ -1,4 +1,3 @@
-'Access-Control-Allow-Origin': '*'
 'use strict';
 // ═══════════════════════════════════════════════════
 //  Smart Timetable Scheduler — Backend Server (v2)
