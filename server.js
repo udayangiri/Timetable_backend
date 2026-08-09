@@ -1,11 +1,11 @@
 'use strict';
 // ═══════════════════════════════════════════════════
-//  Smart Timetable Scheduler — Backend Server (v2)
-//  All 18 audit bugs fixed
+//  Smart Timetable Scheduler — Backend Server (v3)
+//  PostgreSQL version — persistent cloud database
 // ═══════════════════════════════════════════════════
 require('dotenv').config();
 const express     = require('express');
-const Database    = require('better-sqlite3');
+const { Pool }    = require('pg');
 const bcrypt      = require('bcryptjs');
 const jwt         = require('jsonwebtoken');
 const cors        = require('cors');
@@ -16,12 +16,23 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || '';
 
-// FIX 6: Refuse to start with default/missing JWT secret
+// Refuse to start with weak JWT secret
 if(!JWT_SECRET || JWT_SECRET.length < 32){
-  console.error('\n❌ FATAL: JWT_SECRET must be set in .env and be at least 32 characters.');
-  console.error('   Run: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
-  console.error('   Copy the output into your .env file as JWT_SECRET=<value>\n');
+  console.error('\n❌ FATAL: JWT_SECRET must be set and be at least 32 characters.');
   process.exit(1);
+}
+
+// ── PostgreSQL Pool ─────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Helper — run a query
+async function q(sql, params=[]){
+  const client = await pool.connect();
+  try{ return await client.query(sql, params); }
+  finally{ client.release(); }
 }
 
 // ── Middleware ──────────────────────────────────────
@@ -29,7 +40,7 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// FIX 5: Rate limiting on auth endpoints (10 req / 15 min per IP)
+// Rate limiting on auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -38,135 +49,123 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ── SQLite Database ─────────────────────────────────
-const db = new Database(path.join(__dirname, 'timetable.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-
 // ── Schema ──────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    email         TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    name          TEXT NOT NULL,
-    role          TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
-    pwd_hash      TEXT NOT NULL,
-    active        INTEGER NOT NULL DEFAULT 1,
-    tab_perms     TEXT NOT NULL DEFAULT '["none","none","none","none","none","none"]',
-    pwd_changed_at TEXT DEFAULT NULL,
-    created_at    TEXT DEFAULT (datetime('now')),
-    updated_at    TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS instances (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    name          TEXT UNIQUE NOT NULL,
-    data_version  INTEGER NOT NULL DEFAULT 1,
-    created_at    TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS faculty (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-    faculty_id    TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    load_periods  INTEGER NOT NULL DEFAULT 0,
-    day_schedule  TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(instance_id, faculty_id)
-  );
-  CREATE TABLE IF NOT EXISTS subjects (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-    subject_id    TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    load_periods  INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(instance_id, subject_id)
-  );
-  CREATE TABLE IF NOT EXISTS sections (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-    name          TEXT NOT NULL,
-    slot_start    TEXT NOT NULL,
-    slot_end      TEXT NOT NULL,
-    class_days    TEXT NOT NULL DEFAULT '[]'
-  );
-  CREATE TABLE IF NOT EXISTS assignments (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-    section_name  TEXT NOT NULL,
-    faculty_id    TEXT NOT NULL,
-    subject_id    TEXT NOT NULL,
-    faculty_name  TEXT NOT NULL,
-    subject_name  TEXT NOT NULL,
-    weekly_load   INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(instance_id, section_name, faculty_id, subject_id)
-  );
-  CREATE TABLE IF NOT EXISTS timetables (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-    generated_at  TEXT DEFAULT (datetime('now')),
-    generated_by  INTEGER REFERENCES users(id),
-    tt_json       TEXT NOT NULL,
-    sec_slots_json TEXT NOT NULL,
-    UNIQUE(instance_id)
-  );
-  CREATE TABLE IF NOT EXISTS audit_log (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       INTEGER REFERENCES users(id),
-    action        TEXT NOT NULL,
-    detail        TEXT,
-    ts            TEXT DEFAULT (datetime('now'))
-  );
-`);
+async function initSchema(){
+  await q(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            SERIAL PRIMARY KEY,
+      email         TEXT UNIQUE NOT NULL,
+      name          TEXT NOT NULL,
+      role          TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
+      pwd_hash      TEXT NOT NULL,
+      active        BOOLEAN NOT NULL DEFAULT TRUE,
+      tab_perms     TEXT NOT NULL DEFAULT '["none","none","none","none","none","none"]',
+      pwd_changed_at TIMESTAMPTZ DEFAULT NULL,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS instances (
+      id            SERIAL PRIMARY KEY,
+      name          TEXT UNIQUE NOT NULL,
+      data_version  INTEGER NOT NULL DEFAULT 1,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS faculty (
+      id            SERIAL PRIMARY KEY,
+      instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+      faculty_id    TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      load_periods  INTEGER NOT NULL DEFAULT 0,
+      day_schedule  TEXT NOT NULL DEFAULT '{}',
+      UNIQUE(instance_id, faculty_id)
+    );
+    CREATE TABLE IF NOT EXISTS subjects (
+      id            SERIAL PRIMARY KEY,
+      instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+      subject_id    TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      load_periods  INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(instance_id, subject_id)
+    );
+    CREATE TABLE IF NOT EXISTS sections (
+      id            SERIAL PRIMARY KEY,
+      instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+      name          TEXT NOT NULL,
+      slot_start    TEXT NOT NULL,
+      slot_end      TEXT NOT NULL,
+      class_days    TEXT NOT NULL DEFAULT '[]'
+    );
+    CREATE TABLE IF NOT EXISTS assignments (
+      id            SERIAL PRIMARY KEY,
+      instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+      section_name  TEXT NOT NULL,
+      faculty_id    TEXT NOT NULL,
+      subject_id    TEXT NOT NULL,
+      faculty_name  TEXT NOT NULL,
+      subject_name  TEXT NOT NULL,
+      weekly_load   INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(instance_id, section_name, faculty_id, subject_id)
+    );
+    CREATE TABLE IF NOT EXISTS timetables (
+      id            SERIAL PRIMARY KEY,
+      instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+      generated_at  TIMESTAMPTZ DEFAULT NOW(),
+      generated_by  INTEGER REFERENCES users(id),
+      tt_json       TEXT NOT NULL,
+      sec_slots_json TEXT NOT NULL,
+      UNIQUE(instance_id)
+    );
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id            SERIAL PRIMARY KEY,
+      user_id       INTEGER REFERENCES users(id),
+      action        TEXT NOT NULL,
+      detail        TEXT,
+      ts            TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
 
-// Add missing columns to existing DBs (migration)
-const cols = db.prepare("PRAGMA table_info(users)").all().map(c=>c.name);
-// SQLite ALTER TABLE does not support non-constant defaults — use a fixed timestamp string
-if(!cols.includes('pwd_changed_at'))
-  db.exec("ALTER TABLE users ADD COLUMN pwd_changed_at TEXT DEFAULT '2000-01-01 00:00:00'");
-const icols = db.prepare("PRAGMA table_info(instances)").all().map(c=>c.name);
-if(!icols.includes('data_version'))
-  db.exec("ALTER TABLE instances ADD COLUMN data_version INTEGER NOT NULL DEFAULT 1");
-
-// ── Seed ────────────────────────────────────────────
-(function seed(){
-  if(!db.prepare('SELECT COUNT(*) as n FROM users').get().n){
-    db.prepare(`INSERT INTO users(email,name,role,pwd_hash,active,tab_perms)
-                VALUES(?,?,?,?,1,?)`)
-      .run('admin@school.edu','Administrator','admin',
-           bcrypt.hashSync('admin123',10),
-           JSON.stringify(['edit','edit','edit','edit','edit','edit']));
+  // Seed default admin if no users exist
+  const { rows } = await q('SELECT COUNT(*) as n FROM users');
+  if(parseInt(rows[0].n) === 0){
+    const hash = await bcrypt.hash('admin123', 10);
+    await q(
+      `INSERT INTO users(email,name,role,pwd_hash,active,tab_perms) VALUES($1,$2,$3,$4,TRUE,$5)`,
+      ['admin@school.edu','Administrator','admin', hash,
+       JSON.stringify(['edit','edit','edit','edit','edit','edit'])]
+    );
     console.log('✅ Default admin: admin@school.edu / admin123  ← CHANGE THIS NOW');
   }
-  if(!db.prepare('SELECT COUNT(*) as n FROM instances').get().n){
-    db.prepare('INSERT INTO instances(name) VALUES(?)').run('Default');
+
+  // Seed default instance if none exists
+  const inst = await q('SELECT COUNT(*) as n FROM instances');
+  if(parseInt(inst.rows[0].n) === 0){
+    await q(`INSERT INTO instances(name) VALUES($1)`, ['Default']);
     console.log('✅ Default instance created');
   }
-})();
+
+  console.log('✅ Database schema ready');
+}
 
 // ── Helpers ─────────────────────────────────────────
 function signToken(user){
   return jwt.sign({ id:user.id, email:user.email, role:user.role }, JWT_SECRET, { expiresIn:'8h' });
 }
-function audit(userId, action, detail=''){
-  try{ db.prepare('INSERT INTO audit_log(user_id,action,detail) VALUES(?,?,?)').run(userId||null,action,detail||''); }
+async function audit(userId, action, detail=''){
+  try{ await q('INSERT INTO audit_log(user_id,action,detail) VALUES($1,$2,$3)', [userId||null,action,detail||'']); }
   catch(e){ console.error('Audit log error:',e.message); }
 }
-// FIX 1: email validation helper
 function validEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e||'')); }
-// FIX 2: safe integer instance_id parser
-// FIX: strict integer check — reject strings like "1;DROP TABLE" that parseInt accepts as 1
 function parseInstId(v){ const s=String(v||'').trim(); if(!/^\d+$/.test(s)) return null; const n=parseInt(s,10); return n>0?n:null; }
 
 // ── Auth Middleware ──────────────────────────────────
-function requireAuth(req,res,next){
+async function requireAuth(req,res,next){
   const h=req.headers.authorization;
   if(!h||!h.startsWith('Bearer ')) return res.status(401).json({error:'Not authenticated'});
   try{
     const payload = jwt.verify(h.slice(7), JWT_SECRET);
-    const u = db.prepare('SELECT * FROM users WHERE id=?').get(payload.id);
+    const { rows } = await q('SELECT * FROM users WHERE id=$1', [payload.id]);
+    const u = rows[0];
     if(!u||!u.active) return res.status(401).json({error:'Account revoked or not found'});
-    // FIX 7: only invalidate tokens if pwd_changed_at is non-NULL
-    // NULL means no post-creation password change — skip check so new users work immediately
-    // When set: changedAt+1 ensures same-second tokens are also rejected
     if(u.pwd_changed_at){
       const changedAt = Math.floor(new Date(u.pwd_changed_at).getTime()/1000) + 1;
       if(payload.iat < changedAt) return res.status(401).json({error:'Token expired after password change — please log in again.'});
@@ -189,7 +188,6 @@ function requireTabPerm(tabIdx,minPerm='view'){
     next();
   };
 }
-// FIX 9: check if user has edit on ANY data tab (for sync)
 function requireAnyEditPerm(req,res,next){
   if(req.dbUser.role==='admin') return next();
   const perms=JSON.parse(req.dbUser.tab_perms||'[]');
@@ -200,20 +198,19 @@ function requireAnyEditPerm(req,res,next){
 // ════════════════════════════════════════════════════
 //  AUTH ROUTES
 // ════════════════════════════════════════════════════
-// FIX 4+5: async bcrypt + rate limiting
 app.post('/api/auth/login', authLimiter, async (req,res)=>{
   try{
     const {email,password}=req.body;
     if(!email||!password) return res.status(400).json({error:'Email and password required'});
-    const u=db.prepare('SELECT * FROM users WHERE email=?').get((email||'').toLowerCase().trim());
-    if(!u)         return res.status(401).json({error:'No account found for this email'});
-    if(!u.active)  return res.status(401).json({error:'Account has been revoked'});
-    // FIX 4: async bcrypt — non-blocking
+    const { rows } = await q('SELECT * FROM users WHERE LOWER(email)=$1', [(email||'').toLowerCase().trim()]);
+    const u = rows[0];
+    if(!u)        return res.status(401).json({error:'No account found for this email'});
+    if(!u.active) return res.status(401).json({error:'Account has been revoked'});
     const ok = await bcrypt.compare(password, u.pwd_hash);
-    if(!ok)        return res.status(401).json({error:'Incorrect password'});
-    audit(u.id,'LOGIN');
+    if(!ok)       return res.status(401).json({error:'Incorrect password'});
+    await audit(u.id,'LOGIN');
     res.json({token:signToken(u), user:{id:u.id,email:u.email,name:u.name,role:u.role,tabPerms:JSON.parse(u.tab_perms)}});
-  }catch(e){ res.status(500).json({error:'Login failed'}); }
+  }catch(e){ console.error(e); res.status(500).json({error:'Login failed'}); }
 });
 
 app.post('/api/auth/change-password', requireAuth, async (req,res)=>{
@@ -221,17 +218,13 @@ app.post('/api/auth/change-password', requireAuth, async (req,res)=>{
     const {currentPassword,newPassword}=req.body;
     if(!currentPassword||!newPassword) return res.status(400).json({error:'Both passwords required'});
     if(newPassword.length<6)           return res.status(400).json({error:'New password must be at least 6 characters'});
-    // FIX 4: async bcrypt
     const ok = await bcrypt.compare(currentPassword, req.dbUser.pwd_hash);
     if(!ok) return res.status(401).json({error:'Current password is incorrect'});
     const hash = await bcrypt.hash(newPassword,10);
-    // FIX 7: update pwd_changed_at so old tokens are invalidated; NULL→non-NULL triggers check
-    db.prepare("UPDATE users SET pwd_hash=?, pwd_changed_at=datetime('now'), updated_at=datetime('now') WHERE id=?")
-      .run(hash, req.dbUser.id);
-    // Audit AFTER the update so it's only logged on success
-    audit(req.user.id,'CHANGE_PASSWORD');
+    await q("UPDATE users SET pwd_hash=$1, pwd_changed_at=NOW(), updated_at=NOW() WHERE id=$2", [hash, req.dbUser.id]);
+    await audit(req.user.id,'CHANGE_PASSWORD');
     res.json({ok:true});
-  }catch(e){ console.error('change-password error:',e); res.status(500).json({error:'Password change failed'}); }
+  }catch(e){ console.error(e); res.status(500).json({error:'Password change failed'}); }
 });
 
 app.get('/api/auth/me', requireAuth, (req,res)=>{
@@ -242,339 +235,356 @@ app.get('/api/auth/me', requireAuth, (req,res)=>{
 // ════════════════════════════════════════════════════
 //  ADMIN — USER MANAGEMENT
 // ════════════════════════════════════════════════════
-app.get('/api/admin/users', requireAuth, requireAdmin, (req,res)=>{
-  const users=db.prepare('SELECT id,email,name,role,active,tab_perms,created_at FROM users ORDER BY id').all();
-  res.json(users.map(u=>({...u,tabPerms:JSON.parse(u.tab_perms)})));
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req,res)=>{
+  const { rows } = await q('SELECT id,email,name,role,active,tab_perms,created_at FROM users ORDER BY id');
+  res.json(rows.map(u=>({...u,tabPerms:JSON.parse(u.tab_perms)})));
 });
 
 app.post('/api/admin/users', requireAuth, requireAdmin, async (req,res)=>{
   try{
     const {email,name,role,password,tabPerms}=req.body;
     if(!email||!name||!password) return res.status(400).json({error:'Email, name and password required'});
-    // FIX 1: validate email format
     if(!validEmail(email)) return res.status(400).json({error:'Invalid email address format'});
     if(password.length<6)  return res.status(400).json({error:'Password must be at least 6 characters'});
     if(!['admin','user'].includes(role||'user')) return res.status(400).json({error:'Invalid role'});
     const perms=role==='admin'
       ? JSON.stringify(['edit','edit','edit','edit','edit','edit'])
       : JSON.stringify((tabPerms||[]).slice(0,6).map(p=>['none','view','edit'].includes(p)?p:'none'));
-    // FIX 4: async hash
     const hash=await bcrypt.hash(password,10);
-    const info=db.prepare('INSERT INTO users(email,name,role,pwd_hash,active,tab_perms) VALUES(?,?,?,?,1,?)')
-      .run(email.toLowerCase().trim(),name,role||'user',hash,perms);
-    audit(req.user.id,'ADD_USER',email);
-    res.json({ok:true,id:info.lastInsertRowid});
+    const { rows } = await q(
+      'INSERT INTO users(email,name,role,pwd_hash,active,tab_perms) VALUES($1,$2,$3,$4,TRUE,$5) RETURNING id',
+      [email.toLowerCase().trim(), name, role||'user', hash, perms]
+    );
+    await audit(req.user.id,'ADD_USER',email);
+    res.json({ok:true,id:rows[0].id});
   }catch(e){
-    if(e.message.includes('UNIQUE')) return res.status(409).json({error:'Email already exists'});
+    if(e.message.includes('unique') || e.message.includes('duplicate')) return res.status(409).json({error:'Email already exists'});
     res.status(500).json({error:e.message});
   }
 });
 
-app.patch('/api/admin/users/:id/permissions', requireAuth, requireAdmin, (req,res)=>{
-  const {tabPerms,role}=req.body;
-  const uid=parseInt(req.params.id);
-  const target=db.prepare('SELECT * FROM users WHERE id=?').get(uid);
-  if(!target) return res.status(404).json({error:'User not found'});
-  const newRole=role||target.role;
-  const perms=newRole==='admin'
-    ? JSON.stringify(['edit','edit','edit','edit','edit','edit'])
-    : JSON.stringify((tabPerms||JSON.parse(target.tab_perms)).slice(0,6).map(p=>['none','view','edit'].includes(p)?p:'none'));
-  db.prepare("UPDATE users SET tab_perms=?, role=?, updated_at=datetime('now') WHERE id=?").run(perms,newRole,uid);
-  audit(req.user.id,'EDIT_PERMS',`uid=${uid}`);
-  res.json({ok:true});
+app.patch('/api/admin/users/:id/permissions', requireAuth, requireAdmin, async (req,res)=>{
+  try{
+    const {tabPerms,role}=req.body;
+    const uid=parseInt(req.params.id);
+    const { rows } = await q('SELECT * FROM users WHERE id=$1', [uid]);
+    const target = rows[0];
+    if(!target) return res.status(404).json({error:'User not found'});
+    const newRole=role||target.role;
+    const perms=newRole==='admin'
+      ? JSON.stringify(['edit','edit','edit','edit','edit','edit'])
+      : JSON.stringify((tabPerms||JSON.parse(target.tab_perms)).slice(0,6).map(p=>['none','view','edit'].includes(p)?p:'none'));
+    await q("UPDATE users SET tab_perms=$1, role=$2, updated_at=NOW() WHERE id=$3", [perms,newRole,uid]);
+    await audit(req.user.id,'EDIT_PERMS',`uid=${uid}`);
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-app.patch('/api/admin/users/:id/revoke', requireAuth, requireAdmin, (req,res)=>{
+app.patch('/api/admin/users/:id/revoke', requireAuth, requireAdmin, async (req,res)=>{
   const uid=parseInt(req.params.id);
   if(uid===req.user.id) return res.status(400).json({error:'Cannot revoke your own account'});
-  db.prepare("UPDATE users SET active=0, updated_at=datetime('now') WHERE id=?").run(uid);
-  audit(req.user.id,'REVOKE_USER',`uid=${uid}`);
+  await q("UPDATE users SET active=FALSE, updated_at=NOW() WHERE id=$1", [uid]);
+  await audit(req.user.id,'REVOKE_USER',`uid=${uid}`);
   res.json({ok:true});
 });
 
-app.patch('/api/admin/users/:id/restore', requireAuth, requireAdmin, (req,res)=>{
-  db.prepare("UPDATE users SET active=1, updated_at=datetime('now') WHERE id=?").run(parseInt(req.params.id));
-  audit(req.user.id,'RESTORE_USER',`uid=${req.params.id}`);
+app.patch('/api/admin/users/:id/restore', requireAuth, requireAdmin, async (req,res)=>{
+  await q("UPDATE users SET active=TRUE, updated_at=NOW() WHERE id=$1", [parseInt(req.params.id)]);
+  await audit(req.user.id,'RESTORE_USER',`uid=${req.params.id}`);
   res.json({ok:true});
 });
 
-app.delete('/api/admin/users/:id', requireAuth, requireAdmin, (req,res)=>{
+app.delete('/api/admin/users/:id', requireAuth, requireAdmin, async (req,res)=>{
   const uid=parseInt(req.params.id);
   if(uid===req.user.id) return res.status(400).json({error:'Cannot delete your own account'});
-  db.prepare('DELETE FROM users WHERE id=?').run(uid);
-  audit(req.user.id,'DELETE_USER',`uid=${uid}`);
+  await q('DELETE FROM users WHERE id=$1', [uid]);
+  await audit(req.user.id,'DELETE_USER',`uid=${uid}`);
   res.json({ok:true});
 });
 
 app.post('/api/admin/users/:id/reset-password', requireAuth, requireAdmin, async (req,res)=>{
   try{
-    const {newPassword}=req.body;
-    if(!newPassword||newPassword.length<6) return res.status(400).json({error:'Min 6 characters'});
-    const hash=await bcrypt.hash(newPassword,10);
-    // FIX 7: reset pwd_changed_at so old tokens of that user are invalidated
-    db.prepare("UPDATE users SET pwd_hash=?, pwd_changed_at=datetime('now'), updated_at=datetime('now') WHERE id=?")
-      .run(hash,parseInt(req.params.id));
-    audit(req.user.id,'RESET_PASSWORD',`uid=${req.params.id}`);
+    const {new_password}=req.body;
+    if(!new_password||new_password.length<6) return res.status(400).json({error:'Password must be at least 6 characters'});
+    const hash=await bcrypt.hash(new_password,10);
+    await q("UPDATE users SET pwd_hash=$1, pwd_changed_at=NOW(), updated_at=NOW() WHERE id=$2", [hash,parseInt(req.params.id)]);
+    await audit(req.user.id,'RESET_PASSWORD',`uid=${req.params.id}`);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-app.get('/api/admin/audit-log', requireAuth, requireAdmin, (req,res)=>{
-  const rows=db.prepare('SELECT a.*,u.email FROM audit_log a LEFT JOIN users u ON a.user_id=u.id ORDER BY a.ts DESC LIMIT 200').all();
+app.get('/api/admin/audit-log', requireAuth, requireAdmin, async (req,res)=>{
+  const { rows } = await q(`
+    SELECT a.id,a.action,a.detail,a.ts,u.email,u.name
+    FROM audit_log a LEFT JOIN users u ON u.id=a.user_id
+    ORDER BY a.ts DESC LIMIT 200
+  `);
   res.json(rows);
 });
 
 // ════════════════════════════════════════════════════
 //  INSTANCES
 // ════════════════════════════════════════════════════
-app.get('/api/instances', requireAuth, (req,res)=>{
-  res.json(db.prepare('SELECT * FROM instances ORDER BY name').all());
+app.get('/api/instances', requireAuth, async (req,res)=>{
+  const { rows } = await q('SELECT * FROM instances ORDER BY id');
+  res.json(rows);
 });
 
-app.post('/api/instances', requireAuth, requireAdmin, (req,res)=>{
-  const {name}=req.body;
-  if(!name||!name.trim()) return res.status(400).json({error:'Instance name required'});
+app.post('/api/instances', requireAuth, requireAdmin, async (req,res)=>{
   try{
-    const info=db.prepare('INSERT INTO instances(name) VALUES(?)').run(name.trim());
-    audit(req.user.id,'CREATE_INSTANCE',name);
-    res.json({ok:true,id:info.lastInsertRowid});
+    const {name}=req.body;
+    if(!name) return res.status(400).json({error:'Instance name required'});
+    const { rows } = await q('INSERT INTO instances(name) VALUES($1) RETURNING id', [name]);
+    await audit(req.user.id,'CREATE_INSTANCE',name);
+    res.json({ok:true,id:rows[0].id});
   }catch(e){
-    if(e.message.includes('UNIQUE')) return res.status(409).json({error:'Instance name already exists'});
-    throw e;
+    if(e.message.includes('unique')||e.message.includes('duplicate')) return res.status(409).json({error:'Instance name already exists'});
+    res.status(500).json({error:e.message});
   }
 });
 
-app.delete('/api/instances/:id', requireAuth, requireAdmin, (req,res)=>{
-  db.prepare('DELETE FROM instances WHERE id=?').run(parseInt(req.params.id));
-  audit(req.user.id,'DELETE_INSTANCE',`id=${req.params.id}`);
-  res.json({ok:true});
-});
-
 // ════════════════════════════════════════════════════
-//  DATA ENDPOINTS
+//  FACULTY
 // ════════════════════════════════════════════════════
-app.get('/api/faculty', requireAuth, requireTabPerm(0,'view'), (req,res)=>{
-  // FIX 3: validate instance_id
+app.get('/api/faculty', requireAuth, requireTabPerm(0,'view'), async (req,res)=>{
   const iid=parseInstId(req.query.instance_id);
   if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  const rows=db.prepare('SELECT * FROM faculty WHERE instance_id=? ORDER BY faculty_id').all(iid);
-  // FIX 16: null-safe day_schedule parsing
-  res.json(rows.map(r=>({...r,daySchedule:JSON.parse(r.day_schedule||'{}')})));
+  const { rows } = await q('SELECT * FROM faculty WHERE instance_id=$1 ORDER BY faculty_id', [iid]);
+  res.json(rows.map(r=>{
+    const ds=JSON.parse(r.day_schedule||'{}');
+    const dayKeys=Object.keys(ds);
+    const firstDay=dayKeys.length>0?ds[dayKeys[0]]:null;
+    return {id:r.faculty_id,name:r.name,load:r.load_periods,daySchedule:ds,days:dayKeys,
+      start:firstDay?.start||'',end:firstDay?.end||''};
+  }));
 });
 
-app.post('/api/faculty', requireAuth, requireTabPerm(0,'edit'), (req,res)=>{
-  const {instance_id,faculty_id,name,load_periods,daySchedule}=req.body;
+app.post('/api/faculty', requireAuth, requireTabPerm(0,'edit'), async (req,res)=>{
+  const {instance_id,faculty_id,name,load,daySchedule}=req.body;
   const iid=parseInstId(instance_id);
-  if(!iid||!faculty_id||!name) return res.status(400).json({error:'instance_id, faculty_id, name required'});
+  if(!iid||!faculty_id||!name) return res.status(400).json({error:'instance_id, faculty_id and name required'});
   try{
-    db.prepare(`INSERT INTO faculty(instance_id,faculty_id,name,load_periods,day_schedule) VALUES(?,?,?,?,?)
-      ON CONFLICT(instance_id,faculty_id) DO UPDATE SET name=excluded.name,load_periods=excluded.load_periods,day_schedule=excluded.day_schedule`)
-      .run(iid,faculty_id,name,load_periods||0,JSON.stringify(daySchedule||{}));
-    audit(req.user.id,'UPSERT_FACULTY',faculty_id);
+    await q(`INSERT INTO faculty(instance_id,faculty_id,name,load_periods,day_schedule) VALUES($1,$2,$3,$4,$5)
+      ON CONFLICT(instance_id,faculty_id) DO UPDATE SET name=EXCLUDED.name,load_periods=EXCLUDED.load_periods,day_schedule=EXCLUDED.day_schedule`,
+      [iid,faculty_id,name,load||0,JSON.stringify(daySchedule||{})]);
+    await audit(req.user.id,'UPSERT_FACULTY',`${faculty_id}/${name}`);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// FIX 3: guard instance_id on DELETE
-app.delete('/api/faculty/:faculty_id', requireAuth, requireTabPerm(0,'edit'), (req,res)=>{
-  const iid=parseInstId(req.query.instance_id);
-  if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  db.prepare('DELETE FROM faculty WHERE instance_id=? AND faculty_id=?').run(iid,req.params.faculty_id);
-  db.prepare('DELETE FROM assignments WHERE instance_id=? AND faculty_id=?').run(iid,req.params.faculty_id);
-  audit(req.user.id,'DELETE_FACULTY',req.params.faculty_id);
+app.delete('/api/faculty/:id', requireAuth, requireTabPerm(0,'edit'), async (req,res)=>{
+  await q('DELETE FROM faculty WHERE id=$1', [parseInt(req.params.id)]);
+  await audit(req.user.id,'DELETE_FACULTY',`id=${req.params.id}`);
   res.json({ok:true});
 });
 
-app.get('/api/subjects', requireAuth, requireTabPerm(1,'view'), (req,res)=>{
+// ════════════════════════════════════════════════════
+//  SUBJECTS
+// ════════════════════════════════════════════════════
+app.get('/api/subjects', requireAuth, requireTabPerm(1,'view'), async (req,res)=>{
   const iid=parseInstId(req.query.instance_id);
   if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  res.json(db.prepare('SELECT * FROM subjects WHERE instance_id=? ORDER BY subject_id').all(iid));
+  const { rows } = await q('SELECT * FROM subjects WHERE instance_id=$1', [iid]);
+  res.json(rows.map(r=>({id:r.subject_id,name:r.name,load:r.load_periods})));
 });
 
-app.post('/api/subjects', requireAuth, requireTabPerm(1,'edit'), (req,res)=>{
-  const {instance_id,subject_id,name,load_periods}=req.body;
+app.post('/api/subjects', requireAuth, requireTabPerm(1,'edit'), async (req,res)=>{
+  const {instance_id,subject_id,name,load}=req.body;
   const iid=parseInstId(instance_id);
-  if(!iid||!subject_id||!name) return res.status(400).json({error:'instance_id, subject_id, name required'});
+  if(!iid||!subject_id||!name) return res.status(400).json({error:'instance_id, subject_id and name required'});
   try{
-    db.prepare(`INSERT INTO subjects(instance_id,subject_id,name,load_periods) VALUES(?,?,?,?)
-      ON CONFLICT(instance_id,subject_id) DO UPDATE SET name=excluded.name,load_periods=excluded.load_periods`)
-      .run(iid,subject_id,name,load_periods||0);
-    audit(req.user.id,'UPSERT_SUBJECT',subject_id);
+    await q(`INSERT INTO subjects(instance_id,subject_id,name,load_periods) VALUES($1,$2,$3,$4)
+      ON CONFLICT(instance_id,subject_id) DO UPDATE SET name=EXCLUDED.name,load_periods=EXCLUDED.load_periods`,
+      [iid,subject_id,name,load||0]);
+    await audit(req.user.id,'UPSERT_SUBJECT',`${subject_id}/${name}`);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-app.delete('/api/subjects/:subject_id', requireAuth, requireTabPerm(1,'edit'), (req,res)=>{
-  const iid=parseInstId(req.query.instance_id);
-  if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  db.prepare('DELETE FROM subjects WHERE instance_id=? AND subject_id=?').run(iid,req.params.subject_id);
-  db.prepare('DELETE FROM assignments WHERE instance_id=? AND subject_id=?').run(iid,req.params.subject_id);
-  audit(req.user.id,'DELETE_SUBJECT',req.params.subject_id);
+app.delete('/api/subjects/:id', requireAuth, requireTabPerm(1,'edit'), async (req,res)=>{
+  await q('DELETE FROM subjects WHERE id=$1', [parseInt(req.params.id)]);
+  await audit(req.user.id,'DELETE_SUBJECT',`id=${req.params.id}`);
   res.json({ok:true});
 });
 
-app.get('/api/sections', requireAuth, requireTabPerm(2,'view'), (req,res)=>{
+// ════════════════════════════════════════════════════
+//  SECTIONS
+// ════════════════════════════════════════════════════
+app.get('/api/sections', requireAuth, requireTabPerm(2,'view'), async (req,res)=>{
   const iid=parseInstId(req.query.instance_id);
   if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  const rows=db.prepare('SELECT * FROM sections WHERE instance_id=? ORDER BY name,slot_start').all(iid);
-  res.json(rows.map(r=>({...r,days:JSON.parse(r.class_days||'[]')})));
+  const { rows } = await q('SELECT * FROM sections WHERE instance_id=$1', [iid]);
+  res.json(rows.map(r=>({id:r.id,name:r.name,start:r.slot_start,end:r.slot_end,days:JSON.parse(r.class_days||'[]')})));
 });
 
-app.post('/api/sections', requireAuth, requireTabPerm(2,'edit'), (req,res)=>{
+app.post('/api/sections', requireAuth, requireTabPerm(2,'edit'), async (req,res)=>{
   const {instance_id,name,slot_start,slot_end,days}=req.body;
   const iid=parseInstId(instance_id);
   if(!iid||!name||!slot_start||!slot_end) return res.status(400).json({error:'All section fields required'});
-  const info=db.prepare('INSERT INTO sections(instance_id,name,slot_start,slot_end,class_days) VALUES(?,?,?,?,?)')
-    .run(iid,name,slot_start,slot_end,JSON.stringify(days||[]));
-  audit(req.user.id,'ADD_SECTION',`${name} ${slot_start}-${slot_end}`);
-  res.json({ok:true,id:info.lastInsertRowid});
+  const { rows } = await q(
+    'INSERT INTO sections(instance_id,name,slot_start,slot_end,class_days) VALUES($1,$2,$3,$4,$5) RETURNING id',
+    [iid,name,slot_start,slot_end,JSON.stringify(days||[])]);
+  await audit(req.user.id,'ADD_SECTION',`${name} ${slot_start}-${slot_end}`);
+  res.json({ok:true,id:rows[0].id});
 });
 
-app.delete('/api/sections/:id', requireAuth, requireTabPerm(2,'edit'), (req,res)=>{
-  db.prepare('DELETE FROM sections WHERE id=?').run(parseInt(req.params.id));
-  audit(req.user.id,'DELETE_SECTION',`id=${req.params.id}`);
+app.delete('/api/sections/:id', requireAuth, requireTabPerm(2,'edit'), async (req,res)=>{
+  await q('DELETE FROM sections WHERE id=$1', [parseInt(req.params.id)]);
+  await audit(req.user.id,'DELETE_SECTION',`id=${req.params.id}`);
   res.json({ok:true});
 });
 
-app.get('/api/assignments', requireAuth, requireTabPerm(3,'view'), (req,res)=>{
+// ════════════════════════════════════════════════════
+//  ASSIGNMENTS
+// ════════════════════════════════════════════════════
+app.get('/api/assignments', requireAuth, requireTabPerm(3,'view'), async (req,res)=>{
   const iid=parseInstId(req.query.instance_id);
   if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  res.json(db.prepare('SELECT * FROM assignments WHERE instance_id=? ORDER BY section_name').all(iid));
+  const { rows } = await q('SELECT * FROM assignments WHERE instance_id=$1 ORDER BY section_name', [iid]);
+  res.json(rows);
 });
 
-app.post('/api/assignments', requireAuth, requireTabPerm(3,'edit'), (req,res)=>{
+app.post('/api/assignments', requireAuth, requireTabPerm(3,'edit'), async (req,res)=>{
   const {instance_id,section_name,faculty_id,subject_id,faculty_name,subject_name,weekly_load}=req.body;
   const iid=parseInstId(instance_id);
   if(!iid||!section_name||!faculty_id||!subject_id) return res.status(400).json({error:'Required fields missing'});
   try{
-    db.prepare(`INSERT INTO assignments(instance_id,section_name,faculty_id,subject_id,faculty_name,subject_name,weekly_load)
-      VALUES(?,?,?,?,?,?,?) ON CONFLICT(instance_id,section_name,faculty_id,subject_id)
-      DO UPDATE SET faculty_name=excluded.faculty_name,subject_name=excluded.subject_name,weekly_load=excluded.weekly_load`)
-      .run(iid,section_name,faculty_id,subject_id,faculty_name||'',subject_name||'',weekly_load||0);
-    audit(req.user.id,'UPSERT_ASSIGNMENT',`${section_name}/${faculty_id}/${subject_id}`);
+    await q(`INSERT INTO assignments(instance_id,section_name,faculty_id,subject_id,faculty_name,subject_name,weekly_load)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT(instance_id,section_name,faculty_id,subject_id)
+      DO UPDATE SET faculty_name=EXCLUDED.faculty_name,subject_name=EXCLUDED.subject_name,weekly_load=EXCLUDED.weekly_load`,
+      [iid,section_name,faculty_id,subject_id,faculty_name||'',subject_name||'',weekly_load||0]);
+    await audit(req.user.id,'UPSERT_ASSIGNMENT',`${section_name}/${faculty_id}/${subject_id}`);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// FIX 11: DELETE by row id OR by composite key
-app.delete('/api/assignments/:id', requireAuth, requireTabPerm(3,'edit'), (req,res)=>{
-  db.prepare('DELETE FROM assignments WHERE id=?').run(parseInt(req.params.id));
-  audit(req.user.id,'DELETE_ASSIGNMENT',`id=${req.params.id}`);
-  res.json({ok:true});
-});
-// FIX 11: additional route — delete by composite key (what frontend uses)
-app.delete('/api/assignments', requireAuth, requireTabPerm(3,'edit'), (req,res)=>{
-  const {instance_id,section_name,faculty_id,subject_id}=req.body;
-  const iid=parseInstId(instance_id);
-  if(!iid||!section_name||!faculty_id||!subject_id) return res.status(400).json({error:'instance_id, section_name, faculty_id, subject_id required'});
-  db.prepare('DELETE FROM assignments WHERE instance_id=? AND section_name=? AND faculty_id=? AND subject_id=?')
-    .run(iid,section_name,faculty_id,subject_id);
-  audit(req.user.id,'DELETE_ASSIGNMENT',`${section_name}/${faculty_id}/${subject_id}`);
+app.delete('/api/assignments/:id', requireAuth, requireTabPerm(3,'edit'), async (req,res)=>{
+  await q('DELETE FROM assignments WHERE id=$1', [parseInt(req.params.id)]);
+  await audit(req.user.id,'DELETE_ASSIGNMENT',`id=${req.params.id}`);
   res.json({ok:true});
 });
 
-// FIX 2+8+9: BULK SYNC — validate instance_id, check per-entity perms, clear stale timetable
-app.post('/api/sync', requireAuth, requireAnyEditPerm, (req,res)=>{
+app.delete('/api/assignments', requireAuth, requireTabPerm(3,'edit'), async (req,res)=>{
+  const {instance_id,section_name,faculty_id,subject_id}=req.body;
+  const iid=parseInstId(instance_id);
+  if(!iid||!section_name||!faculty_id||!subject_id) return res.status(400).json({error:'instance_id, section_name, faculty_id, subject_id required'});
+  await q('DELETE FROM assignments WHERE instance_id=$1 AND section_name=$2 AND faculty_id=$3 AND subject_id=$4',
+    [iid,section_name,faculty_id,subject_id]);
+  await audit(req.user.id,'DELETE_ASSIGNMENT',`${section_name}/${faculty_id}/${subject_id}`);
+  res.json({ok:true});
+});
+
+// ════════════════════════════════════════════════════
+//  BULK SYNC
+// ════════════════════════════════════════════════════
+app.post('/api/sync', requireAuth, requireAnyEditPerm, async (req,res)=>{
   const {instance_id,data}=req.body;
-  // FIX 2: validate instance_id is a real integer
   const iid=parseInstId(instance_id);
   if(!iid||!data) return res.status(400).json({error:'Valid instance_id and data required'});
   const isAdmin=req.dbUser.role==='admin';
   const perms=JSON.parse(req.dbUser.tab_perms||'[]');
   const canEdit=(i)=>isAdmin||perms[i]==='edit';
-
-  const syncTx=db.transaction(()=>{
-    // Only clear/sync tables the user has edit access to
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
     if(canEdit(0)){
-      db.prepare('DELETE FROM faculty WHERE instance_id=?').run(iid);
-      const ins=db.prepare('INSERT INTO faculty(instance_id,faculty_id,name,load_periods,day_schedule) VALUES(?,?,?,?,?)');
-      (data.faculty||[]).forEach(f=>ins.run(iid,f.id,f.name,f.load||0,JSON.stringify(f.daySchedule||{})));
+      await client.query('DELETE FROM faculty WHERE instance_id=$1',[iid]);
+      for(const f of (data.faculty||[])){
+        await client.query('INSERT INTO faculty(instance_id,faculty_id,name,load_periods,day_schedule) VALUES($1,$2,$3,$4,$5)',
+          [iid,f.id,f.name,f.load||0,JSON.stringify(f.daySchedule||{})]);
+      }
     }
     if(canEdit(1)){
-      db.prepare('DELETE FROM subjects WHERE instance_id=?').run(iid);
-      const ins=db.prepare('INSERT INTO subjects(instance_id,subject_id,name,load_periods) VALUES(?,?,?,?)');
-      (data.subjects||[]).forEach(s=>ins.run(iid,s.id,s.name,s.load||0));
+      await client.query('DELETE FROM subjects WHERE instance_id=$1',[iid]);
+      for(const s of (data.subjects||[])){
+        await client.query('INSERT INTO subjects(instance_id,subject_id,name,load_periods) VALUES($1,$2,$3,$4)',
+          [iid,s.id,s.name,s.load||0]);
+      }
     }
     if(canEdit(2)){
-      db.prepare('DELETE FROM sections WHERE instance_id=?').run(iid);
-      const ins=db.prepare('INSERT INTO sections(instance_id,name,slot_start,slot_end,class_days) VALUES(?,?,?,?,?)');
-      (data.sections||[]).forEach(s=>ins.run(iid,s.name,s.start,s.end,JSON.stringify(s.days||[])));
+      await client.query('DELETE FROM sections WHERE instance_id=$1',[iid]);
+      for(const s of (data.sections||[])){
+        await client.query('INSERT INTO sections(instance_id,name,slot_start,slot_end,class_days) VALUES($1,$2,$3,$4,$5)',
+          [iid,s.name,s.start,s.end,JSON.stringify(s.days||[])]);
+      }
     }
     if(canEdit(3)){
-      db.prepare('DELETE FROM assignments WHERE instance_id=?').run(iid);
-      const ins=db.prepare(`INSERT INTO assignments(instance_id,section_name,faculty_id,subject_id,faculty_name,subject_name,weekly_load) VALUES(?,?,?,?,?,?,?)`);
-      (data.assignments||[]).forEach(a=>ins.run(iid,a.sectionName,a.facultyId,a.subjectId,a.facultyName||'',a.subjectName||'',a.weeklyLoad||0));
+      await client.query('DELETE FROM assignments WHERE instance_id=$1',[iid]);
+      for(const a of (data.assignments||[])){
+        await client.query(`INSERT INTO assignments(instance_id,section_name,faculty_id,subject_id,faculty_name,subject_name,weekly_load)
+          VALUES($1,$2,$3,$4,$5,$6,$7)`,
+          [iid,a.sectionName,a.facultyId,a.subjectId,a.facultyName||'',a.subjectName||'',a.weeklyLoad||0]);
+      }
     }
-    // FIX 8: if faculty or sections changed, the stored timetable is stale — delete it
     if(canEdit(0)||canEdit(2)){
-      db.prepare('DELETE FROM timetables WHERE instance_id=?').run(iid);
+      await client.query('DELETE FROM timetables WHERE instance_id=$1',[iid]);
     }
-    // FIX 18: bump data_version for optimistic concurrency
-    db.prepare('UPDATE instances SET data_version=data_version+1 WHERE id=?').run(iid);
-  });
-
-  try{
-    syncTx();
-    const ver=db.prepare('SELECT data_version FROM instances WHERE id=?').get(iid)?.data_version;
-    audit(req.user.id,'BULK_SYNC',`instance=${iid}`);
-    res.json({ok:true,data_version:ver});
-  }catch(e){ res.status(500).json({error:e.message}); }
+    await client.query('UPDATE instances SET data_version=data_version+1 WHERE id=$1',[iid]);
+    await client.query('COMMIT');
+    const ver=await client.query('SELECT data_version FROM instances WHERE id=$1',[iid]);
+    await audit(req.user.id,'BULK_SYNC',`instance=${iid}`);
+    res.json({ok:true,data_version:ver.rows[0]?.data_version||1});
+  }catch(e){
+    await client.query('ROLLBACK');
+    res.status(500).json({error:e.message});
+  }finally{ client.release(); }
 });
 
 // LOAD instance data
-app.get('/api/sync/:instance_id', requireAuth, (req,res)=>{
+app.get('/api/sync/:instance_id', requireAuth, async (req,res)=>{
   const iid=parseInstId(req.params.instance_id);
   if(!iid) return res.status(400).json({error:'Valid instance_id required'});
   const isAdmin=req.dbUser.role==='admin';
   const perms=JSON.parse(req.dbUser.tab_perms||'[]');
   const canView=(i)=>isAdmin||(perms[i]||'none')!=='none';
 
-  const faculty=canView(0)?db.prepare('SELECT * FROM faculty WHERE instance_id=? ORDER BY faculty_id').all(iid)
+  const faculty=canView(0)?(await q('SELECT * FROM faculty WHERE instance_id=$1 ORDER BY faculty_id',[iid])).rows
     .map(r=>{
-      // FIX 16: null-safe; days always an array even if daySchedule is empty
-      const ds = JSON.parse(r.day_schedule||'{}');
-      const dayKeys = Object.keys(ds);
-      const firstDay = dayKeys.length > 0 ? ds[dayKeys[0]] : null;
-      return {
-        id: r.faculty_id, name: r.name, load: r.load_periods,
-        daySchedule: ds,
-        days: dayKeys,
-        start: firstDay?.start || '',
-        end:   firstDay?.end   || ''
-      };
+      const ds=JSON.parse(r.day_schedule||'{}');
+      const dayKeys=Object.keys(ds);
+      const firstDay=dayKeys.length>0?ds[dayKeys[0]]:null;
+      return {id:r.faculty_id,name:r.name,load:r.load_periods,daySchedule:ds,days:dayKeys,
+        start:firstDay?.start||'',end:firstDay?.end||''};
     }):[];
-  const subjects=canView(1)?db.prepare('SELECT * FROM subjects WHERE instance_id=?').all(iid)
+  const subjects=canView(1)?(await q('SELECT * FROM subjects WHERE instance_id=$1',[iid])).rows
     .map(r=>({id:r.subject_id,name:r.name,load:r.load_periods})):[];
-  const sections=canView(2)?db.prepare('SELECT * FROM sections WHERE instance_id=?').all(iid)
+  const sections=canView(2)?(await q('SELECT * FROM sections WHERE instance_id=$1',[iid])).rows
     .map(r=>({name:r.name,start:r.slot_start,end:r.slot_end,days:JSON.parse(r.class_days||'[]')})):[];
-  const assignments=canView(3)?db.prepare('SELECT * FROM assignments WHERE instance_id=?').all(iid)
+  const assignments=canView(3)?(await q('SELECT * FROM assignments WHERE instance_id=$1',[iid])).rows
     .map(r=>({sectionName:r.section_name,facultyId:r.faculty_id,subjectId:r.subject_id,
       facultyName:r.faculty_name,subjectName:r.subject_name,weeklyLoad:r.weekly_load})):[];
-  const inst=db.prepare('SELECT data_version FROM instances WHERE id=?').get(iid);
+  const inst=(await q('SELECT data_version FROM instances WHERE id=$1',[iid])).rows[0];
   res.json({faculty,subjects,sections,assignments,data_version:inst?.data_version||1});
 });
 
-// TIMETABLE
-app.get('/api/timetable/:instance_id', requireAuth, requireTabPerm(4,'view'), (req,res)=>{
+// ════════════════════════════════════════════════════
+//  TIMETABLE
+// ════════════════════════════════════════════════════
+app.get('/api/timetable/:instance_id', requireAuth, requireTabPerm(4,'view'), async (req,res)=>{
   const iid=parseInstId(req.params.instance_id);
   if(!iid) return res.status(400).json({error:'Valid instance_id required'});
-  const row=db.prepare('SELECT * FROM timetables WHERE instance_id=?').get(iid);
-  if(!row) return res.status(404).json({error:'No timetable generated yet'});
+  const { rows } = await q('SELECT * FROM timetables WHERE instance_id=$1',[iid]);
+  if(!rows[0]) return res.status(404).json({error:'No timetable generated yet'});
+  const row=rows[0];
   res.json({tt:JSON.parse(row.tt_json),secSlots:JSON.parse(row.sec_slots_json),generatedAt:row.generated_at});
 });
 
-app.post('/api/timetable/:instance_id', requireAuth, requireTabPerm(4,'edit'), (req,res)=>{
+app.post('/api/timetable/:instance_id', requireAuth, requireTabPerm(4,'edit'), async (req,res)=>{
   const {tt,secSlots}=req.body;
   const iid=parseInstId(req.params.instance_id);
   if(!iid||!tt||!secSlots) return res.status(400).json({error:'tt and secSlots required'});
-  db.prepare(`INSERT INTO timetables(instance_id,generated_by,tt_json,sec_slots_json) VALUES(?,?,?,?)
-    ON CONFLICT(instance_id) DO UPDATE SET generated_at=datetime('now'),generated_by=excluded.generated_by,
-    tt_json=excluded.tt_json,sec_slots_json=excluded.sec_slots_json`)
-    .run(iid,req.user.id,JSON.stringify(tt),JSON.stringify(secSlots));
-  audit(req.user.id,'SAVE_TIMETABLE',`instance=${iid}`);
+  await q(`INSERT INTO timetables(instance_id,generated_by,tt_json,sec_slots_json) VALUES($1,$2,$3,$4)
+    ON CONFLICT(instance_id) DO UPDATE SET generated_at=NOW(),generated_by=EXCLUDED.generated_by,
+    tt_json=EXCLUDED.tt_json,sec_slots_json=EXCLUDED.sec_slots_json`,
+    [iid,req.user.id,JSON.stringify(tt),JSON.stringify(secSlots)]);
+  await audit(req.user.id,'SAVE_TIMETABLE',`instance=${iid}`);
   res.json({ok:true});
 });
 
+// ════════════════════════════════════════════════════
+//  HEALTH + ERROR HANDLER
+// ════════════════════════════════════════════════════
 app.get('/api/health',(req,res)=>res.json({status:'ok',time:new Date().toISOString()}));
 
 app.use((err,req,res,next)=>{
@@ -582,4 +592,12 @@ app.use((err,req,res,next)=>{
   res.status(500).json({error:'Internal server error'});
 });
 
-app.listen(PORT,()=>console.log(`\n🚀 Timetable backend running at http://localhost:${PORT}\n`));
+// ════════════════════════════════════════════════════
+//  START
+// ════════════════════════════════════════════════════
+initSchema().then(()=>{
+  app.listen(PORT,()=>console.log(`\n🚀 Timetable backend (PostgreSQL) running at http://localhost:${PORT}\n`));
+}).catch(e=>{
+  console.error('❌ Failed to initialize database:',e.message);
+  process.exit(1);
+});
